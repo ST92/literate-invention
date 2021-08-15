@@ -1,13 +1,21 @@
 mod simulationtime;
-use std::{collections::{HashMap, LinkedList}, sync::{Arc, Condvar, atomic::AtomicU32}, time::Duration, vec};
+use std::{
+    collections::HashMap,
+    sync::{atomic::AtomicU32, Arc, Condvar},
+    time::Duration,
+    vec,
+};
 
 #[macro_use]
 extern crate lazy_static;
 
 use actix::prelude::*;
 use actix_web::rt::System;
+use futures::future::join_all;
 use lazy_static::__Deref;
 use rand::prelude::*;
+use simulationtime::ChaoticActorPool;
+use tokio::join;
 
 /// Represents physical place (intersections) in the working zone
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -28,11 +36,12 @@ impl Default for Location {
     }
 }
 
-fn main() {
-    /// Initialize actor subsystem
+#[actix_rt::main]
+async fn main() {
+    // Initialize actor subsystem
     let system = System::new("fun");
 
-    /// Start the real-time clock
+    // Start the real-time clock
     let world_clock = AtomicU32::new(0);
     let tick_tock = std::sync::Condvar::new();
 
@@ -47,22 +56,27 @@ fn main() {
     };
     std::thread::spawn(tick_tock_thread);
 
-    /// Create the population
+    // Create the population
     let mediator = Mediator::start_default();
 
-    let mut courier_pool = LinkedList::new();
+    let mut courier_pool = simulationtime::ChaoticActorPool::<DeliveryGuy>::default();
 
-    let pool_initial = thread_rng().next_u32() % 10;
+    let pool_initial = 2 + thread_rng().next_u32() % 10;
     let (join_rate, defect_rate) = (0.15, 0.15);
-    
-    for _ in [..pool_initial] {
-        let courier = DeliveryGuy::start_default();
-        courier.do_send(Invitation(mediator.clone()));
-        courier_pool.push_back(courier);
+
+    courier_pool.inject_defaults(pool_initial);
+    eprintln!("Initialized with {:} couriers.", pool_initial);
+
+    let results = courier_pool
+        .actors
+        .iter()
+        .map(|courier| courier.send(Invitation(mediator.clone())));
+    for response in results {
+        eprintln!("{:?}", response.await);
     }
 
-    /// Start the simulation
-    system.run();
+    // Start the simulation
+    system.run().unwrap();
 }
 
 /// The courier - shuttles cargo from restaurants to clients
@@ -78,6 +92,8 @@ struct DeliveryGuy {
     destination: Option<Location>,
     /// How far from current destination
     remaining_distance: u32,
+
+
 
     /// Management contact
     boss: Option<Addr<Overseer>>,
@@ -99,7 +115,9 @@ impl Default for DeliveryGuy {
 impl Actor for DeliveryGuy {
     type Context = Context<Self>;
 
-    fn started(&mut self, ctx: &mut Self::Context) {}
+    fn started(&mut self, ctx: &mut Self::Context) {
+        eprintln!("{:?}", self);
+    }
 
     fn stopping(&mut self, ctx: &mut Self::Context) -> Running {
         if self.cargo == 0 {
@@ -113,23 +131,27 @@ impl Actor for DeliveryGuy {
 }
 
 impl Handler<Invitation> for DeliveryGuy {
-    type Result = bool;
+    type Result = ();
 
     fn handle(
         &mut self,
         Invitation(mediator): Invitation,
         ctx: &mut Self::Context,
     ) -> Self::Result {
-        let request = mediator.send(RequestAssignment {});
-
-        if let Ok(overseer) = futures::executor::block_on(request) {
-            overseer.do_send(DeliveryGuyReport::CheckIn(ctx.address(), self.report_details()));
-            self.boss = Some(overseer);
-            return true;
-        } else {
-            return false;
-        }
+        eprintln!("Delivery guy {:?} got an invitation", self);
+        mediator.do_send(RequestAssignment);
+        eprintln!("Delivery guy {:?} requests assignment", self);
     }
+}
+impl Handler<Addr<Overseer>> for DeliveryGuy {
+    type Result = ();
+
+    fn handle(&mut self, msg: Addr<Overseer>, ctx: &mut Self::Context) -> Self::Result {
+        todo!()
+    }
+}
+impl Message for Addr<Overseer> {
+    type Result = ();
 }
 impl Handler<DeliveryWorkOrder> for DeliveryGuy {
     type Result = ();
@@ -143,11 +165,11 @@ impl Handler<DeliveryWorkOrder> for DeliveryGuy {
                 }
             }
             DeliveryWorkOrder::GoToDeliver(location) => {
-                if self.destination.is_none() && !self.report_details().is_unburdened(){
+                if self.destination.is_none() && !self.report_details().is_unburdened() {
                     self.destination = location.into();
                     self.remaining_distance = thread_rng().next_u32() % 100 + 10;
                 }
-            },
+            }
             DeliveryWorkOrder::Report => {
                 if let Some(ref boss) = self.boss {
                     boss.do_send(DeliveryGuyReport::CheckIn(
@@ -174,11 +196,11 @@ impl DeliveryGuy {
 }
 
 /// Overseer - keeps track of couriers and assigns them tasks
-#[derive(Default, Debug, Clone, Copy)]
+#[derive(Default, Debug, Clone)]
 struct Overseer {
     delivery_guys: Vec<Addr<DeliveryGuy>>,
     orders_queue: Vec<DeliveryOrder>,
-    assignments: HashMap<Addr<DeliveryGuy>, Vec<DeliveryOrder>>
+    assignments: HashMap<Addr<DeliveryGuy>, Vec<DeliveryOrder>>,
 }
 impl Overseer {
     fn has_work(self: &Self) -> bool {
@@ -188,7 +210,9 @@ impl Overseer {
 impl Actor for Overseer {
     type Context = Context<Self>;
 
-    fn started(&mut self, ctx: &mut Self::Context) {}
+    fn started(&mut self, ctx: &mut Self::Context) {
+        eprintln!("Overseer starts {:?}", &self);
+    }
 
     fn stopping(&mut self, ctx: &mut Self::Context) -> Running {
         Running::Stop
@@ -214,8 +238,7 @@ impl Handler<DeliveryGuyReport> for Overseer {
                     courier.do_send(DeliveryWorkOrder::GoToPickUp(order.restaurant));
 
                     // here goes the brain of the overseer
-                    // implement assignments 
-                    
+                    // implement assignments
                 }
             }
         }
@@ -223,6 +246,7 @@ impl Handler<DeliveryGuyReport> for Overseer {
 }
 
 /// Manages Overseers and gets couriers and overseers in touch
+#[derive(Debug)]
 struct Mediator {
     overseers: Vec<Overseer>,
     overseers_addr: Vec<Addr<Overseer>>,
@@ -231,7 +255,7 @@ struct Mediator {
 impl Default for Mediator {
     fn default() -> Self {
         let mut overseers = vec![];
-        for _ in [..rand::thread_rng().next_u32() % 10] {
+        for _ in [..2 + rand::thread_rng().next_u32() % 10] {
             overseers.push(Overseer::default());
         }
 
@@ -246,7 +270,18 @@ impl Actor for Mediator {
     type Context = Context<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
-        self.overseers_addr.extend(self.overseers.iter().map(|ov| ov.start()));
+        eprintln!(
+            "Mediator {:?} starts himself and his {:} overseers!",
+            self,
+            self.overseers.len()
+        );
+
+        for ref overseer in self.overseers.as_slice() {
+            let overseed = overseer.clone();
+            let addr = overseed.clone().start();
+            self.overseers_addr.push(addr);
+            eprintln!("Overseer kicked off!");
+        }
     }
 
     fn stopped(&mut self, ctx: &mut Self::Context) {}
@@ -256,7 +291,9 @@ impl Handler<RequestAssignment> for Mediator {
     type Result = Addr<Overseer>;
 
     fn handle(&mut self, msg: RequestAssignment, ctx: &mut Self::Context) -> Self::Result {
+        eprintln!("Mediator got assignment request!");
         let overseer = self.overseers_addr.choose(&mut thread_rng()).unwrap();
+        eprintln!("Picked {:?}", overseer);
         overseer.clone()
     }
 }
@@ -269,14 +306,12 @@ struct Client {
     started_on: u32,
     initial_delay: u32,
     order_complexity: u32,
-    home_location: Location
+    home_location: Location,
 }
 impl Actor for Client {
     type Context = Context<Self>;
 
-    fn started(&mut self, ctx: &mut Self::Context) {
-
-    }
+    fn started(&mut self, ctx: &mut Self::Context) {}
 
     fn stopping(&mut self, ctx: &mut Self::Context) -> Running {
         Running::Stop
@@ -299,7 +334,7 @@ impl Actor for Restaurant {
     fn stopped(&mut self, ctx: &mut Self::Context) {}
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct DeliveryOrder {
     order_complexity: u32,
     restaurant: Location,
@@ -309,7 +344,7 @@ struct DeliveryOrder {
 /// Courier joins the job for the first time, gets introduced to the mediator
 struct Invitation(Addr<Mediator>);
 impl Message for Invitation {
-    type Result = bool;
+    type Result = ();
 }
 
 struct RequestAssignment;
