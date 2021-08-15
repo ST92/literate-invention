@@ -328,10 +328,14 @@ dependencies = [
  "actix-web",
  "config",
  "directories",
+ "futures",
  "geo",
+ "lazy_static",
  "pdf-create",
  "postgres",
  "postgres-types",
+ "rand 0.8.4",
+ "tokio 1.10.0",
  "tokio-postgres",
 ]
 
